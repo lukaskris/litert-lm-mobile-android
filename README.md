@@ -45,7 +45,7 @@ A premium **multimodal** on-device LLM chat application for Android, powered by 
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/carrycooldude/ModelGarden-QNN-LiteRT.git
+git clone https://github.com/lukaskris/litert-lm-mobile-android.git
 cd ModelGarden-QNN-LiteRT
 ```
 
