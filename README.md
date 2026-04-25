@@ -1,4 +1,4 @@
-# ModelGarden-QNN-LiteRT — Gemma 4 On-Device Chat
+# Model Garden Android LiteRT
 
 A premium **multimodal** on-device LLM chat application for Android, powered by **Google LiteRT-LM**. Features **Gemma 4 E2B** as the primary model with support for **text, image, and audio** inputs, running entirely on-device with **NPU/GPU/CPU** acceleration.
 
@@ -17,10 +17,10 @@ A premium **multimodal** on-device LLM chat application for Android, powered by 
 
 *   **Gemma 4 E2B** as the default on-device model (2.58 GB)
 *   **Multimodal Input**: Attach images from gallery and record audio directly in-app
-*   **NPU → GPU → CPU** backend fallback for optimal performance on Snapdragon 8 Elite
+*   **NPU → GPU → CPU** backend fallback with automatic SoC detection (Qualcomm, MediaTek, Exynos, Unisoc)
 *   **ADB Push Support**: Push the model from PC — no in-app download needed for large files
 *   **Multi-Model Support**: Switch between Gemma 4, Gemma 3n, Qwen 3, Gemma 3 1B
-*   **Real-time Benchmarks**: TTFT, tokens/sec, token count
+*   **Real-time Benchmarks**: TTFT, tokens/sec, token count displayed live in the header
 *   **Modern Premium UI**: Deep Blue & Soft Gray aesthetic with streaming responses
 
 ## Benchmarks (Samsung S25 Ultra - Snapdragon 8 Elite)
@@ -82,10 +82,105 @@ The app will automatically detect the model in `/sdcard/Download/` on launch.
 5.  **Switch Models**: Settings → Select Model to try other models
 6.  **Benchmarks**: Watch real-time TTFT and tokens/sec in the header
 
+## Improving Load Time & Performance
+
+### 1. Push Models to App-Specific Storage
+
+Pushing directly to the app-specific external directory avoids the file-copy step the app performs when models are found in `/sdcard/Download/`. This copy (2.58 GB for Gemma 4) can take 30-60 seconds on internal storage.
+
+```bash
+# Fastest path — no copy needed on launch
+adb push gemma-4-E2B-it.litertlm /sdcard/Android/data/com.example.qnn_litertlm_gemma/files/
+```
+
+### 2. AOT Compile for NPU (Qualcomm Devices)
+
+On Snapdragon devices, use the [Colab notebook](./google_colab/LiteRT_Gemma4_NPU_AOT_Compilation.ipynb) to Ahead-Of-Time compile the model for the NPU. Without AOT, the QNN delegate must JIT-compile at load time, which adds 30-120 seconds to initialization and may fail entirely.
+
+AOT-compiled models:
+- Skip JIT compilation on device
+- Initialize in seconds instead of minutes
+- Achieve the best possible inference throughput on Snapdragon NPU
+
+### 3. Enable R8/ProGuard for Release Builds
+
+The current `build.gradle.kts` has minification disabled. Enabling it shrinks the APK and removes unused code from LiteRT delegates:
+
+```kotlin
+// app/build.gradle.kts
+buildTypes {
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true
+        proguardFiles(
+            getDefaultProguardFile("proguard-android-optimize.txt"),
+            "proguard-rules.pro"
+        )
+    }
+}
+```
+
+This reduces APK size by removing unused delegate code and can improve cold start time.
+
+### 4. Select the Right Backend for Your SoC
+
+The app auto-detects your SoC vendor and skips backends that won't work:
+
+| SoC | Backend Chain | Notes |
+| :--- | :--- | :--- |
+| **Qualcomm Snapdragon** | NPU → GPU → CPU | NPU requires AOT-compiled model for best results |
+| **MediaTek Dimensity/Helio** | GPU → CPU | NPU skipped — QNN delegate is Qualcomm-only |
+| **Samsung Exynos** | GPU → CPU | NPU skipped |
+| **Unisoc** | GPU → CPU | NPU skipped |
+
+You can also manually override the backend in Settings → Select Model. For fastest text-only inference on Qualcomm, use NPU. For multimodal (image + text), GPU is used for vision encoding regardless of the text backend.
+
+### 5. Reduce Image Resolution for Faster Vision Encoding
+
+The app automatically downscales attached images to a maximum of **256px** on the longest edge before sending to the model. This keeps the vision patch count low and avoids GPU lockups on Mali GPUs (MediaTek) that can freeze the UI compositor for 15+ seconds with larger images.
+
+If you are modifying the code, do not increase this beyond 512px on non-Qualcomm devices. On Snapdragon with NPU, you may safely raise it to 512px for better visual detail at the cost of slightly longer encoding time.
+
+### 6. Keep the Model in Internal Storage
+
+The LiteRT-LM engine uses `mmap()` to load model weights. Files on internal storage (`context.filesDir`) are accessible without SELinux restrictions and can be memory-mapped directly. If the model is on external storage, the app copies it to internal first — this is a one-time cost, but avoid deleting it from internal storage.
+
+### 7. Use `cacheDir` for Faster Subsequent Loads
+
+The app passes `context.cacheDir` to the LiteRT-LM `EngineConfig`. The engine caches compiled kernels and intermediate artifacts here, so the second and subsequent initializations are faster than the first. Do not clear the app cache between sessions if you want fast reloads.
+
+### 8. Dedicated Inference Thread Pool
+
+Inference runs on a dedicated thread pool (not `Dispatchers.IO` or `Dispatchers.Default`) with:
+- **Pool size**: Half the CPU cores (minimum 1, always leaves 2+ cores free for UI)
+- **Thread priority**: Below normal — the OS scheduler prioritizes the UI thread over inference
+- **Thread.yield()**: Called per token to periodically yield CPU time back to the UI
+
+This ensures the UI remains responsive even during heavy inference. On an 8-core device, inference uses 4 threads at reduced priority while the main thread and system services keep the remaining cores.
+
+### 9. UI Update Throttling
+
+Streaming tokens are throttled to one UI update every **120ms**. Without throttling, each token triggers a RecyclerView rebind and layout pass, which causes jank — especially on devices where the GPU is shared between inference and rendering.
+
+The app uses payload-based `notifyItemChanged()` with a partial-bind payload, so only the text content is rebound — not the entire message layout.
+
+### 10. Use Smaller Models for Faster TTFT
+
+If low latency is more important than response quality, switch to a smaller model:
+
+| Model | Size | Typical TTFT | Use Case |
+| :--- | :--- | :--- | :--- |
+| **Qwen 3 0.6B** | ~0.5 GB | Fastest | Quick answers, low resource |
+| **Gemma 3 1B** | ~1 GB | Fast | General purpose text |
+| **Gemma 3n E2B** | ~1.5 GB | Moderate | Text conversations |
+| **Gemma 4 E2B** | 2.58 GB | Slowest | Multimodal (text + image + audio) |
+
 ## Notes on Hardware Acceleration
 
-*   The app tries **NPU** first (Qualcomm Hexagon on Snapdragon 8 Elite), then falls back to **GPU** (OpenCL/ML Drift), then **CPU** (XNNPack)
-*   NPU requires device-specific libraries — falls back gracefully if unavailable
+*   The app tries **NPU** first (Qualcomm Hexagon on Snapdragon), then falls back to **GPU** (OpenCL/ML Drift), then **CPU** (XNNPack)
+*   NPU requires AOT compilation for reliable results — use the Colab notebook above
+*   On non-Qualcomm devices, NPU is skipped entirely to avoid wasting 30-120s on a guaranteed failure
+*   Vision encoding always uses **GPU** — CPU vision encoding is too slow for production use
 *   `cacheDir` is used for faster model reloading on subsequent launches
 
 ## References

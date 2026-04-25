@@ -9,7 +9,10 @@ data class ChatMessage(
     val sender: MessageSender,
     val content: String,
     val timestamp: Date = Date(),
-    val isStreaming: Boolean = false
+    val isStreaming: Boolean = false,
+    val imagePath: String? = null,
+    val thinkingSeconds: Int = 0,
+    val thinkingLabel: String = "Thinking..."
 )
 
 /**

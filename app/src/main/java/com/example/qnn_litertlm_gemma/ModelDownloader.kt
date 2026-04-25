@@ -13,6 +13,11 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
+data class AdbPaths(
+    val recommendedDir: String,
+    val appSpecificDir: String
+)
+
 /**
  * Utility class for downloading LiteRT-LM models.
  *
@@ -66,21 +71,40 @@ class ModelDownloader(private val context: Context) {
 
     /**
      * Well-known directories to check for ADB-pushed model files.
-     * On Android 11+, /sdcard/Download is often restricted.
-     * The safest place is /sdcard/Android/data/<package>/files/
+     * On Android 11+, /sdcard/Download is restricted unless
+     * MANAGE_EXTERNAL_STORAGE permission is granted.
+     * The safest place is the app-specific external directory.
      */
     private fun getAdbSearchDirs(): List<File> {
         val dirs = mutableListOf<File>()
-        
+
         // App-specific external storage (No permissions required)
         context.getExternalFilesDir(null)?.let { dirs.add(it) }
         context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.let { dirs.add(it) }
-        
-        // Legacy public directories (may require MANAGE_EXTERNAL_STORAGE on Android 11+)
-        dirs.add(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
-        dirs.add(File(Environment.getExternalStorageDirectory(), "Models"))
-        
+
+        // Public directories (require MANAGE_EXTERNAL_STORAGE on Android 11+)
+        if (Environment.isExternalStorageManager()) {
+            dirs.add(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
+            dirs.add(File(Environment.getExternalStorageDirectory(), "Models"))
+        } else {
+            // Still check — works on pre-Android 11 or if permissions allow
+            dirs.add(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
+            dirs.add(File(Environment.getExternalStorageDirectory(), "Models"))
+        }
+
         return dirs
+    }
+
+    /**
+     * Get recommended ADB push paths for showing in the UI dialog.
+     */
+    fun getAdbPaths(): AdbPaths {
+        val appDir = context.getExternalFilesDir(null)?.absolutePath
+            ?: "/sdcard/Android/data/${context.packageName}/files"
+        return AdbPaths(
+            recommendedDir = appDir,
+            appSpecificDir = appDir
+        )
     }
 
     fun saveToken(token: String) {
@@ -117,15 +141,26 @@ class ModelDownloader(private val context: Context) {
     }
 
     /**
-     * Get the local model path. Prefers internal storage; falls back to
-     * external ADB-pushed location.
+     * Get the local model path. Always ensures the file is in internal storage.
+     * If found externally (ADB push to /sdcard/Download etc.), copies to internal first
+     * because the native LiteRT-LM engine may not be able to mmap() files on external
+     * storage due to SELinux restrictions on Android 11+.
      */
     fun getModelPath(modelConfig: ModelConfig): String {
         val internal = File(context.filesDir, modelConfig.filename)
-        if (internal.exists()) return internal.absolutePath
+        if (internal.exists() && internal.length() > 0) return internal.absolutePath
 
         val external = findExternalModel(modelConfig)
-        if (external != null) return external.absolutePath
+        if (external != null) {
+            Log.i(TAG, "Copying external model to internal storage: ${external.absolutePath} → ${internal.absolutePath}")
+            external.inputStream().use { input ->
+                internal.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            Log.i(TAG, "Copy complete: ${internal.length()} bytes")
+            return internal.absolutePath
+        }
 
         // Default to internal path (for download target)
         return internal.absolutePath

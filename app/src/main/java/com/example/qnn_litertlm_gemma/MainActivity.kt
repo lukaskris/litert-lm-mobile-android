@@ -4,11 +4,15 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.MediaStore
+import android.provider.Settings
 import android.util.Log
 import android.text.Editable
 import android.text.TextWatcher
@@ -25,10 +29,14 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.example.qnn_litertlm_gemma.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -161,10 +169,14 @@ class MainActivity : AppCompatActivity() {
         chatAdapter = ChatAdapter()
         binding.recyclerViewMessages.apply {
             adapter = chatAdapter
+            // Disable item animations — each insert/change would trigger
+            // a GPU-accelerated animateChange/animateAdd which competes
+            // with vision encoding on Mali GPUs.
+            itemAnimator = null
             layoutManager = LinearLayoutManager(this@MainActivity).apply {
                 stackFromEnd = true
             }
-            
+
             addOnLayoutChangeListener { _, _, _, _, bottom, _, _, _, oldBottom ->
                 if (bottom < oldBottom) {
                     binding.recyclerViewMessages.postDelayed({
@@ -215,24 +227,74 @@ class MainActivity : AppCompatActivity() {
     private fun handleImageUri(uri: Uri) {
         lifecycleScope.launch {
             try {
-                // Copy to a temp file the engine can read
+                binding.textAttachmentStatus.text = "Processing image..."
+                binding.textAttachmentStatus.visibility = View.VISIBLE
+
                 val tempFile = File(cacheDir, "attached_image.jpg")
                 withContext(Dispatchers.IO) {
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        tempFile.outputStream().use { output ->
-                            input.copyTo(output)
-                        }
+                    // Decode with bounds first to get dimensions without loading full bitmap
+                    val inputStream = contentResolver.openInputStream(uri)
+                        ?: throw Exception("Cannot open image")
+
+                    val boundsOnly = BitmapFactory.Options().apply {
+                        inJustDecodeBounds = true
                     }
+                    BitmapFactory.decodeStream(inputStream, null, boundsOnly)
+                    inputStream.close()
+
+                    // Downscale to max 256px — keeps patch count low for vision models.
+                    // On Mali GPUs (MediaTek), larger images cause 15+ second GPU lockups
+                    // during vision encoding that freeze the entire UI compositor.
+                    // 256px = fewer patches = shorter GPU lockup = better UX.
+                    val maxDim = 256
+                    val inSampleSize = calculateInSampleSize(boundsOnly.outWidth, boundsOnly.outHeight, maxDim)
+
+                    // Decode the actual bitmap at reduced size
+                    val decodeStream = contentResolver.openInputStream(uri)
+                        ?: throw Exception("Cannot open image")
+                    val options = BitmapFactory.Options().apply {
+                        this.inSampleSize = inSampleSize
+                    }
+                    val bitmap = BitmapFactory.decodeStream(decodeStream, null, options)
+                        ?: throw Exception("Failed to decode image")
+                    decodeStream.close()
+
+                    Log.i("MainActivity", "Image resized: ${bitmap.width}x${bitmap.height} (sample=$inSampleSize)")
+
+                    // Write compressed JPEG to temp file
+                    FileOutputStream(tempFile).use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                    }
+                    bitmap.recycle()
                 }
+
                 pendingImagePath = tempFile.absolutePath
-                binding.textAttachmentStatus.text = "📷 Image attached"
+                binding.textAttachmentStatus.text = "Image attached (${(tempFile.length() / 1024)}KB)"
                 binding.textAttachmentStatus.visibility = View.VISIBLE
                 updateSendButtonState()
-                Toast.makeText(this@MainActivity, "Image attached", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
+                Log.e("MainActivity", "Image attach failed", e)
                 Toast.makeText(this@MainActivity, "Failed to attach image: ${e.message}", Toast.LENGTH_SHORT).show()
+                binding.textAttachmentStatus.visibility = View.GONE
             }
         }
+    }
+
+    /**
+     * Calculate BitmapFactory inSampleSize so the longer edge fits [maxDim].
+     * Result is always a power of 2 for efficiency.
+     */
+    private fun calculateInSampleSize(width: Int, height: Int, maxDim: Int): Int {
+        if (width <= maxDim && height <= maxDim) return 1
+
+        var inSampleSize = 1
+        val longerEdge = maxOf(width, height)
+
+        while (longerEdge / (inSampleSize * 2) >= maxDim) {
+            inSampleSize *= 2
+        }
+
+        return inSampleSize
     }
 
     // ─── Audio Recording ────────────────────────────────────────
@@ -343,26 +405,52 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showAdbOrDownloadDialog(modelConfig: ModelConfig) {
+        val adbPaths = modelDownloader.getAdbPaths()
+        val hasAllFilesAccess = Environment.isExternalStorageManager()
+
         AlertDialog.Builder(this)
             .setTitle("Model Not Found")
             .setMessage(
                 "\"${modelConfig.name}\" is not on this device.\n\n" +
-                "Option 1 (Recommended for large models):\n" +
-                "Push via ADB from your PC:\n" +
-                "  adb push ${modelConfig.filename} /sdcard/Download/\n\n" +
-                "Option 2:\n" +
+                "Option 1 (Recommended):\n" +
+                "Push via ADB to app-specific directory:\n" +
+                "  adb push ${modelConfig.filename} $adbPaths\n\n" +
+                "Option 2: Push to /sdcard/Download/\n" +
+                "  adb push ${modelConfig.filename} /sdcard/Download/\n" +
+                (if (!hasAllFilesAccess) "  ⚠ Requires \"All files access\" permission — tap Grant below.\n" else "  ✓ All files access granted.\n") +
+                "\nOption 3:\n" +
                 "Download directly on device (may be slow for large files)."
             )
+            .apply {
+                if (!hasAllFilesAccess) {
+                    setNeutralButton("Grant Access") { _, _ ->
+                        requestAllFilesAccess()
+                    }
+                }
+            }
             .setPositiveButton("Download Now") { _, _ ->
                 downloadModel(modelConfig)
             }
-            .setNeutralButton("I'll ADB Push") { _, _ ->
-                binding.textLoadingStatus.text = "Push the model via ADB, then reopen the app.\n\nadb push ${modelConfig.filename} /sdcard/Download/"
-            }
-            .setNegativeButton("Cancel") { _, _ ->
-                binding.layoutLoading.visibility = View.GONE
+            .setNegativeButton("I'll ADB Push") { _, _ ->
+                binding.textLoadingStatus.text = "Push the model via ADB, then reopen the app.\n\nadb push ${modelConfig.filename} $adbPaths"
             }
             .show()
+    }
+
+    private fun requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                // Fallback to general all-files settings
+                val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                startActivity(intent)
+            }
+            Toast.makeText(this, "Grant access, then reopen the app.", Toast.LENGTH_LONG).show()
+        }
     }
     
     private fun downloadModel(modelConfig: ModelConfig) {
@@ -439,51 +527,105 @@ class MainActivity : AppCompatActivity() {
     
     // ─── Message Sending ────────────────────────────────────────
 
+    /**
+     * Insert a single message and notify RecyclerView efficiently.
+     * Much cheaper than submitList() + DiffUtil for the whole list.
+     */
+    private fun insertMessage(message: ChatMessage): Int {
+        messages.add(message)
+        val index = messages.size - 1
+        // Notify the adapter backing list so getItem() works
+        chatAdapter.submitList(messages.toList())
+        return index
+    }
+
     private fun sendMessage(text: String) {
-        // Build display text showing what's attached
-        val attachInfo = buildString {
-            if (pendingImagePath != null) append("[📷 Image] ")
-            if (pendingAudioBytes != null) append("[🎙️ Audio] ")
-            append(text)
-        }
-        
-        val userMessage = ChatMessage(MessageSender.USER, attachInfo)
+        // Build display text — use just the prompt text (image shown in bubble)
+        val displayText = text
+        val imagePath = pendingImagePath
+
+        // Add user message + assistant placeholder in ONE batch
+        val userMessage = ChatMessage(MessageSender.USER, displayText, imagePath = imagePath)
         messages.add(userMessage)
-        updateMessages()
-        
+
         val assistantMessageIndex = messages.size
         val assistantMessage = ChatMessage(MessageSender.ASSISTANT, "", isStreaming = true)
         messages.add(assistantMessage)
-        updateMessages()
-        
-        // Capture and clear attachments
-        val imagePath = pendingImagePath
+
+        // Single submitList — RecyclerView processes both inserts in one pass
+        chatAdapter.submitList(messages.toList()) {
+            binding.recyclerViewMessages.scrollToPosition(assistantMessageIndex)
+        }
+
+        // Capture and clear attachments BEFORE launching coroutine
+        val capturedImagePath = pendingImagePath
         val audioBytes = pendingAudioBytes
         clearAttachments()
-        
+
         var firstTokenReceived = false
         var startTime = System.currentTimeMillis()
         var ttft: Long = 0
         var tokenCount = 0
+        var lastUiUpdateTime = 0L
+        val uiUpdateIntervalMs = 120L
+        var thinkingJob: Job? = null
 
+        val isMultimodal = capturedImagePath != null || audioBytes != null
+
+        // Collect on Main — the Flow already does heavy work on IO (flowOn in LiteRTLMManager)
         lifecycleScope.launch {
             var fullResponse = ""
             val requestStartTime = System.nanoTime()
             var firstTokenTime = 0L
-            
+
+            // For multimodal: give the UI 500ms to fully render the new messages
+            // BEFORE vision encoding monopolizes the Mali GPU. Without this delay,
+            // the GPU lockup starts before the RecyclerView has finished drawing,
+            // causing "text disappears then reappears" and 14+ second freezes.
+            if (isMultimodal) {
+                // Cache the RecyclerView as a hardware layer so the GPU can
+                // serve it from cache during vision encoding lockup.
+                binding.recyclerViewMessages.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                delay(500)
+            }
+
+            // Start thinking timer — updates every second until first token arrives
+            thinkingJob = launch {
+                var seconds = 0
+                val label = if (isMultimodal) "Processing image..." else "Thinking..."
+                while (isActive) {
+                    delay(1000)
+                    seconds++
+                    if (!firstTokenReceived) {
+                        messages[assistantMessageIndex] = assistantMessage.copy(
+                            thinkingSeconds = seconds,
+                            thinkingLabel = label
+                        )
+                        chatAdapter.notifyItemChanged(
+                            assistantMessageIndex,
+                            ChatAdapter.PAYLOAD_THINKING_UPDATE
+                        )
+                    }
+                }
+            }
+
             try {
-                val flow = if (imagePath != null || audioBytes != null) {
-                    liteRTLMManager.sendMultimodalMessage(text, imagePath, audioBytes)
+                val flow = if (isMultimodal) {
+                    liteRTLMManager.sendMultimodalMessage(text, capturedImagePath, audioBytes)
                 } else {
                     liteRTLMManager.sendMessage(text)
                 }
-                
+
                 flow.catch { e ->
+                        thinkingJob?.cancel()
                         messages[assistantMessageIndex] = assistantMessage.copy(
                             content = "Error: ${e.message}",
                             isStreaming = false
                         )
                         updateMessages()
+                        if (isMultimodal) {
+                            binding.recyclerViewMessages.setLayerType(View.LAYER_TYPE_NONE, null)
+                        }
                     }
                     .collect { messageChunk ->
                         if (!firstTokenReceived) {
@@ -491,49 +633,67 @@ class MainActivity : AppCompatActivity() {
                             firstTokenReceived = true
                             startTime = System.currentTimeMillis()
                             firstTokenTime = System.nanoTime()
+                            thinkingJob?.cancel()
                         }
-                        
-                        val chunkText = messageChunk.toString()
-                        fullResponse += chunkText
+
+                        fullResponse += messageChunk
                         tokenCount = fullResponse.length / 4 + 1
-                        
-                        messages[assistantMessageIndex] = assistantMessage.copy(
-                            content = fullResponse,
-                            isStreaming = true
-                        )
-                        chatAdapter.notifyItemChanged(assistantMessageIndex)
-                        binding.recyclerViewMessages.smoothScrollToPosition(assistantMessageIndex)
-                        
-                        val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
-                        val speed = if (elapsed > 0) String.format("%.1f", tokenCount / elapsed) else "0"
-                        
-                        binding.textBenchmarkStats.text = "TTFT: ${ttft}ms | ${speed} t/s"
+
+                        val now = System.currentTimeMillis()
+
+                        // Throttle UI updates — cheap payload-based partial bind
+                        if (now - lastUiUpdateTime >= uiUpdateIntervalMs) {
+                            lastUiUpdateTime = now
+                            messages[assistantMessageIndex] = assistantMessage.copy(
+                                content = fullResponse,
+                                isStreaming = true
+                            )
+                            chatAdapter.notifyItemChanged(
+                                assistantMessageIndex,
+                                ChatAdapter.PAYLOAD_STREAMING_UPDATE
+                            )
+                            binding.recyclerViewMessages.scrollToPosition(assistantMessageIndex)
+
+                            val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
+                            val speed = if (elapsed > 0) String.format("%.1f", tokenCount / elapsed) else "0"
+                            binding.textBenchmarkStats.text = "TTFT: ${ttft}ms | ${speed} t/s"
+                        }
                     }
-                
-                // Finalize
+
+                // Finalize — full update with final text
+                thinkingJob?.cancel()
                 messages[assistantMessageIndex] = assistantMessage.copy(
                     content = fullResponse,
                     isStreaming = false
                 )
                 updateMessages()
-                
+
+                // Restore default layer type after inference completes
+                if (isMultimodal) {
+                    binding.recyclerViewMessages.setLayerType(View.LAYER_TYPE_NONE, null)
+                }
+
                 val endTime = System.nanoTime()
-                val ttftMs = (firstTokenTime - requestStartTime) / 1_000_000
-                val generationTimeMs = (endTime - firstTokenTime) / 1_000_000
+                val ttftMs = if (firstTokenTime > 0L) (firstTokenTime - requestStartTime) / 1_000_000 else ttft
+                val generationTimeMs = if (firstTokenTime > 0L) (endTime - firstTokenTime) / 1_000_000 else (endTime - requestStartTime) / 1_000_000
                 val tokens = fullResponse.length / 4.0
                 val tps = if (generationTimeMs > 0) (tokens / (generationTimeMs / 1000.0)) else 0.0
-                
+
                 binding.textBenchmarkStats.text = String.format(
-                    "TTFT: %dms | %.1f t/s | %d tokens", 
+                    "TTFT: %dms | %.1f t/s | %d tokens",
                     ttftMs, tps, tokens.toInt()
                 )
-                
+
             } catch (e: Exception) {
+                thinkingJob?.cancel()
                 messages[assistantMessageIndex] = assistantMessage.copy(
                     content = "Error: ${e.message}",
                     isStreaming = false
                 )
                 updateMessages()
+                if (isMultimodal) {
+                    binding.recyclerViewMessages.setLayerType(View.LAYER_TYPE_NONE, null)
+                }
             }
         }
     }
@@ -564,6 +724,6 @@ class MainActivity : AppCompatActivity() {
                 mediaRecorder?.apply { stop(); release() }
             } catch (_: Exception) {}
         }
-        liteRTLMManager.cleanup()
+        liteRTLMManager.shutdown()
     }
 }

@@ -33,16 +33,31 @@
             android:lineSpacingExtra="4dp" />
 
     </com.google.android.material.card.MaterialCardView>
-    
-    <!-- Optional: Streaming Indicator (Hidden by default) -->
-    <ProgressBar
-        android:id="@+id/typing_indicator"
-        android:layout_width="16dp"
-        android:layout_height="16dp"
-        android:layout_marginTop="4dp"
-        android:indeterminateTint="@color/brand_primary"
+
+    <!-- Thinking status: shows "Thinking... 15s" while waiting for first token -->
+    <TextView
+        android:id="@+id/text_thinking_status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:layout_marginStart="4dp"
+        android:textSize="11sp"
+        android:textColor="@color/brand_primary"
         android:visibility="gone"
-        app:layout_constraintStart_toStartOf="@id/card_bubble"
+        android:drawablePadding="4dp"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/card_bubble" />
+
+    <TextView
+        android:id="@+id/text_timestamp"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="12:30"
+        android:textSize="11sp"
+        android:textColor="@color/text_secondary"
+        app:layout_constraintStart_toStartOf="parent"
+        android:layout_marginStart="4dp"
         app:layout_constraintTop_toBottomOf="@id/card_bubble" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
