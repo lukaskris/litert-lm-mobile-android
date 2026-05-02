@@ -2,7 +2,6 @@ package com.example.qnn_litertlm_gemma
 
 import android.content.Context
 import android.os.Build
-import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
@@ -18,6 +17,7 @@ import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import timber.log.Timber
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -62,7 +62,7 @@ class LiteRTLMManager private constructor(private val context: Context) {
         // Use at most half the cores — always leave 2+ for UI / system
         val poolSize = maxOf(1, minOf(coreCount / 2, coreCount - 2))
 
-        Log.i(TAG, "Inference dispatcher: $poolSize threads (device has $coreCount cores)")
+        Timber.tag(TAG).i("Inference dispatcher: $poolSize threads (device has $coreCount cores)")
 
         Executors.newFixedThreadPool(poolSize) { runnable ->
             Thread(runnable).apply {
@@ -75,6 +75,24 @@ class LiteRTLMManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "LiteRTLMManager"
+        private const val NPU_INIT_TIMEOUT_MS = 30_000L
+
+        init {
+            try {
+                // Order matters: dependencies first
+                System.loadLibrary("QnnSystem")
+                System.loadLibrary("QnnHtp")
+                System.loadLibrary("QnnHtpV79Stub")
+                System.loadLibrary("GemmaModelConstraintProvider")
+                System.loadLibrary("LiteRt")
+                System.loadLibrary("LiteRtDispatch_Qualcomm")
+                System.loadLibrary("LiteRtGpuAccelerator")
+                System.loadLibrary("LiteRtOpenClAccelerator")
+                Timber.tag(TAG).i("Native libraries loaded successfully")
+            } catch (e: UnsatisfiedLinkError) {
+                Timber.tag(TAG).w("Some native libraries not available: ${e.message}")
+            }
+        }
 
         @Volatile
         private var INSTANCE: LiteRTLMManager? = null
@@ -96,14 +114,14 @@ class LiteRTLMManager private constructor(private val context: Context) {
         isEmbedding: Boolean = false,
         preferredBackend: String? = null
     ): Result<Boolean> = withContext(Dispatchers.IO) {
-        Log.i(TAG, "Initializing for: $modelPath (preferred: $preferredBackend)")
+        Timber.tag(TAG).i( "Initializing for: $modelPath (preferred: $preferredBackend)")
         if (isInitialized) {
             cleanup()
         }
         
         try {
             if (isEmbedding) {
-                Log.w(TAG, "Embedding mode not supported in this version")
+                Timber.tag(TAG).w( "Embedding mode not supported in this version")
                 currentBackendName = "CPU"
             } else {
                 // Build ordered backend list based on preference
@@ -111,10 +129,10 @@ class LiteRTLMManager private constructor(private val context: Context) {
                 initializeEngineWithFallback(modelPath, backends)
             }
             isInitialized = true
-            Log.i(TAG, "Initialization SUCCEEDED on backend: $currentBackendName")
+            Timber.tag(TAG).i( "Initialization SUCCEEDED on backend: $currentBackendName")
             Result.success(true)
         } catch (e: Throwable) {
-            Log.e(TAG, "Initialization FAILED: ${e.message}", e)
+            Timber.tag(TAG).e(e, "Initialization FAILED: ${e.message}")
             Result.failure(Exception(e))
         }
     }
@@ -160,28 +178,27 @@ class LiteRTLMManager private constructor(private val context: Context) {
      */
     private fun buildBackendList(preferred: String?): List<BackendFactory> {
         val socVendor = detectSoCVendor()
-        Log.i(TAG, "SoC vendor detected: $socVendor (model=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else "N/A"}, hardware=${Build.HARDWARE})")
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir
+        Timber.tag(TAG).i( "SoC vendor detected: $socVendor (model=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else "N/A"}, hardware=${Build.HARDWARE}, nativeLibDir=$nativeLibDir)")
 
-        val npuBackend = BackendFactory("NPU") {
-            Backend.NPU(nativeLibraryDir = context.applicationInfo.nativeLibraryDir)
+        val npuBackend = BackendFactory("NPU", nativeLibraryDir = nativeLibDir) {
+            Backend.NPU(nativeLibraryDir = nativeLibDir)
         }
         val gpuBackend = BackendFactory("GPU") { Backend.GPU() }
         val cpuBackend = BackendFactory("CPU") { Backend.CPU() }
 
         val backends = when (socVendor) {
             "QUALCOMM" -> {
-                // QNN works — try NPU first as preferred
-                Log.i(TAG, "Qualcomm SoC: NPU → GPU → CPU")
+                Timber.tag(TAG).i( "Qualcomm SoC: NPU → GPU → CPU")
                 listOf(npuBackend, gpuBackend, cpuBackend)
             }
             else -> {
-                // Non-Qualcomm: skip NPU entirely, GPU → CPU
-                Log.i(TAG, "Non-Qualcomm SoC ($socVendor): GPU → CPU (skipping NPU)")
+                Timber.tag(TAG).i( "Non-Qualcomm SoC ($socVendor): GPU → CPU (skipping NPU)")
                 listOf(gpuBackend, cpuBackend)
             }
         }
 
-        // If user explicitly requested a specific backend, respect it
+        // If user explicitly requested a specific backend, move it to front
         if (preferred != null) {
             val preferredUpper = preferred.uppercase()
             val preferredIdx = backends.indexOfFirst { it.name == preferredUpper }
@@ -195,6 +212,8 @@ class LiteRTLMManager private constructor(private val context: Context) {
 
     /**
      * Try each backend in order; stop at the first one that works.
+     * NPU gets a bounded timeout — if it doesn't respond in time,
+     * we skip it and move to GPU/CPU.
      */
     private fun initializeEngineWithFallback(modelPath: String, backends: List<BackendFactory>) {
         var lastError: Throwable? = null
@@ -202,19 +221,66 @@ class LiteRTLMManager private constructor(private val context: Context) {
         for (factory in backends) {
             val attemptStart = System.currentTimeMillis()
             try {
-                Log.i(TAG, "Trying backend: ${factory.name}")
-                initializeEngine(modelPath, factory)
+                Timber.tag(TAG).i( "Trying backend: ${factory.name}")
+
+                if (factory.name == "NPU") {
+                    // Run NPU init on a separate thread with timeout.
+                    // NPU can hang for 60-120s on models without AOT payloads —
+                    // we don't want to block the caller indefinitely.
+                    val result = runWithTimeout(NPU_INIT_TIMEOUT_MS) {
+                        initializeEngine(modelPath, factory)
+                    }
+                    if (result.isFailure) {
+                        throw result.exceptionOrNull()
+                            ?: Exception("NPU initialization timed out or failed")
+                    }
+                } else {
+                    initializeEngine(modelPath, factory)
+                }
+
                 val attemptMs = System.currentTimeMillis() - attemptStart
-                Log.i(TAG, "Backend ${factory.name} SUCCEEDED in ${attemptMs}ms")
+                Timber.tag(TAG).i( "Backend ${factory.name} SUCCEEDED in ${attemptMs}ms")
                 return
             } catch (e: Throwable) {
                 val attemptMs = System.currentTimeMillis() - attemptStart
-                Log.w(TAG, "Backend ${factory.name} FAILED after ${attemptMs}ms: ${e.message}")
+                Timber.tag(TAG).w( "Backend ${factory.name} FAILED after ${attemptMs}ms: ${e.message}")
+                if (factory.name == "NPU") {
+                    Timber.tag(TAG).i( "NPU failed — falling back to next backend")
+                }
                 lastError = e
             }
         }
 
         throw lastError ?: IllegalStateException("All backends failed")
+    }
+
+    /**
+     * Run a blocking operation with a timeout.
+     * Returns Result.success if completed, Result.failure if timed out or threw.
+     */
+    private fun runWithTimeout(timeoutMs: Long, block: () -> Unit): Result<Unit> {
+        var exception: Throwable? = null
+        val thread = Thread {
+            try {
+                block()
+            } catch (e: Throwable) {
+                exception = e
+            }
+        }
+        thread.name = "npu-init-timeout"
+        thread.start()
+        thread.join(timeoutMs)
+
+        return when {
+            thread.isAlive -> {
+                // Thread still running — NPU is stuck. Log and move on.
+                Timber.tag(TAG).w( "NPU init timed out after ${timeoutMs}ms — interrupting")
+                thread.interrupt()
+                Result.failure(Exception("NPU initialization timed out after ${timeoutMs}ms"))
+            }
+            exception != null -> Result.failure(exception!!)
+            else -> Result.success(Unit)
+        }
     }
 
     private fun initializeEngine(modelPath: String, factory: BackendFactory) {
@@ -225,18 +291,30 @@ class LiteRTLMManager private constructor(private val context: Context) {
         if (!file.canRead()) {
             throw java.io.IOException("Model file not readable (permissions?)")
         }
-        Log.i(TAG, "Model file: ${file.length()} bytes, backend: ${factory.name}")
+        Timber.tag(TAG).i( "Model file: ${file.length()} bytes, backend: ${factory.name}")
 
         val backend = factory.create()
 
-        Log.i(TAG, "Initializing Engine with backend: ${factory.name}")
+        Timber.tag(TAG).i( "Initializing Engine with backend: ${factory.name}")
+
+        // Set ADSP_LIBRARY_PATH for NPU — QNN needs to find SKEL stubs.
+        // Only set when actually trying NPU backend.
+        if (factory.name == "NPU") {
+            try {
+                val libDir = factory.nativeLibraryDir ?: context.applicationInfo.nativeLibraryDir
+                android.system.Os.setenv("ADSP_LIBRARY_PATH", libDir, true)
+                Timber.tag(TAG).i( "Set ADSP_LIBRARY_PATH to $libDir for NPU")
+            } catch (e: Exception) {
+                Timber.tag(TAG).w( "Failed to set ADSP_LIBRARY_PATH: ${e.message}")
+            }
+        }
 
         // Vision always uses GPU — CPU vision encoding is fundamentally too slow
         // for production use (5+ minutes on non-Qualcomm devices).
         // On MediaTek Mali, this causes a ~12s GPU lockup during vision encoding,
         // but the alternative (CPU) never completes in reasonable time.
         val visionBackend = Backend.GPU()
-        Log.i(TAG, "Vision backend: GPU")
+        Timber.tag(TAG).i( "Vision backend: GPU")
 
         val engineConfig = EngineConfig(
             modelPath = modelPath,
@@ -252,27 +330,27 @@ class LiteRTLMManager private constructor(private val context: Context) {
         try {
             candidateEngine.initialize()
             val duration = System.currentTimeMillis() - startTime
-            Log.i(TAG, "Engine initialization SUCCEEDED in ${duration}ms")
+            Timber.tag(TAG).i( "Engine initialization SUCCEEDED in ${duration}ms")
 
             // Verify conversation works — wrap separately so test failure
             // doesn't cascade into closing the engine
             try {
                 val testConv = candidateEngine.createConversation(ConversationConfig())
                 testConv.close()
-                Log.i(TAG, "Test conversation OK")
+                Timber.tag(TAG).i( "Test conversation OK")
             } catch (e: Throwable) {
-                Log.w(TAG, "Test conversation failed (non-fatal): ${e.message}")
+                Timber.tag(TAG).w( "Test conversation failed (non-fatal): ${e.message}")
             }
         } catch (e: Throwable) {
             val duration = System.currentTimeMillis() - startTime
-            Log.e(TAG, "Engine initialization FAILED after ${duration}ms: ${e.message}")
+            Timber.tag(TAG).e( "Engine initialization FAILED after ${duration}ms: ${e.message}")
             if (factory.name == "NPU" && e.message?.contains("TF_LITE_AUX") == true) {
-                Log.e(TAG, "NPU missing AOT payload and JIT compilation failed or was not triggered.")
+                Timber.tag(TAG).e( "NPU missing AOT payload and JIT compilation failed or was not triggered.")
             }
             try {
                 candidateEngine.close()
             } catch (closeErr: Throwable) {
-                Log.w(TAG, "Error closing failed engine: ${closeErr.message}")
+                Timber.tag(TAG).w( "Error closing failed engine: ${closeErr.message}")
             }
             throw e
         }
@@ -332,7 +410,7 @@ class LiteRTLMManager private constructor(private val context: Context) {
         audioBytes: ByteArray? = null
     ): Flow<String> {
         ensureConversation()
-        Log.i(TAG, "Multimodal message: text='${text.take(50)}', image=$imagePath, audio=${audioBytes != null}")
+        Timber.tag(TAG).i( "Multimodal message: text='${text.take(50)}', image=$imagePath, audio=${audioBytes != null}")
         val conv = conversation!!
         return kotlinx.coroutines.flow.flow {
             // This block runs on Dispatchers.IO (via flowOn below).
@@ -395,7 +473,7 @@ class LiteRTLMManager private constructor(private val context: Context) {
             engine = null
             isInitialized = false
         } catch (e: Exception) {
-            Log.e(TAG, "Error during cleanup", e)
+            Timber.tag(TAG).e(e, "Error during cleanup")
         }
     }
 
@@ -417,5 +495,6 @@ class LiteRTLMManager private constructor(private val context: Context) {
  */
 private data class BackendFactory(
     val name: String,
+    val nativeLibraryDir: String? = null,
     val create: () -> Backend
 )

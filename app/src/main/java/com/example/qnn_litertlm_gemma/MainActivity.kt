@@ -13,7 +13,6 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.Settings
-import android.util.Log
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
@@ -35,6 +34,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
 
@@ -65,6 +65,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Plant Timber debug tree for logcat filtering by TAG
+        if (BuildConfig.DEBUG) {
+            Timber.plant(Timber.DebugTree())
+        }
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -259,7 +265,7 @@ class MainActivity : AppCompatActivity() {
                         ?: throw Exception("Failed to decode image")
                     decodeStream.close()
 
-                    Log.i("MainActivity", "Image resized: ${bitmap.width}x${bitmap.height} (sample=$inSampleSize)")
+                    Timber.tag("MainActivity").i("Image resized: ${bitmap.width}x${bitmap.height} (sample=$inSampleSize)")
 
                     // Write compressed JPEG to temp file
                     FileOutputStream(tempFile).use { out ->
@@ -273,7 +279,7 @@ class MainActivity : AppCompatActivity() {
                 binding.textAttachmentStatus.visibility = View.VISIBLE
                 updateSendButtonState()
             } catch (e: Exception) {
-                Log.e("MainActivity", "Image attach failed", e)
+                Timber.tag("MainActivity").e(e, "Image attach failed")
                 Toast.makeText(this@MainActivity, "Failed to attach image: ${e.message}", Toast.LENGTH_SHORT).show()
                 binding.textAttachmentStatus.visibility = View.GONE
             }
@@ -342,7 +348,7 @@ class MainActivity : AppCompatActivity() {
             binding.textAttachmentStatus.visibility = View.VISIBLE
             Toast.makeText(this, "Recording started", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
-            Log.e("MainActivity", "Recording failed: ${e.message}", e)
+            Timber.tag("MainActivity").e(e, "Recording failed: ${e.message}")
             Toast.makeText(this, "Recording failed: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
@@ -373,7 +379,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } catch (e: Exception) {
-            Log.e("MainActivity", "Stop recording failed: ${e.message}", e)
+            Timber.tag("MainActivity").e(e, "Stop recording failed: ${e.message}")
             Toast.makeText(this, "Stop recording failed: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }

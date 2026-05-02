@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.os.Environment
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import timber.log.Timber
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -33,6 +34,8 @@ class ModelDownloader(private val context: Context) {
 
     companion object {
         private const val TAG = "ModelDownloader"
+
+        private fun tag() = Timber.tag(TAG)
         private const val KEY_HF_TOKEN = "hf_token"
 
         // Gemma 4 E2B is the default (first in list)
@@ -43,7 +46,7 @@ class ModelDownloader(private val context: Context) {
                 filename = "gemma-4-E2B-it.litertlm",
                 url = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm",
                 systemPrompt = "You are Gemma 4, a powerful multimodal AI assistant by Google, running privately on-device. You can understand text, images, and audio.",
-                preferredBackend = "NPU"
+                preferredBackend = null
             ),
             ModelConfig(
                 id = "gemma-3n",
@@ -133,7 +136,7 @@ class ModelDownloader(private val context: Context) {
         for (dir in getAdbSearchDirs()) {
             val candidate = File(dir, modelConfig.filename)
             if (candidate.exists() && candidate.canRead() && candidate.length() > 0) {
-                Log.i(TAG, "Found ADB-pushed model at: ${candidate.absolutePath}")
+                tag().i( "Found ADB-pushed model at: ${candidate.absolutePath}")
                 return candidate
             }
         }
@@ -179,7 +182,7 @@ class ModelDownloader(private val context: Context) {
             
             // Already in internal storage
             if (modelFile.exists()) {
-                Log.d(TAG, "Model already exists at ${modelFile.absolutePath}")
+                tag().d( "Model already exists at ${modelFile.absolutePath}")
                 emit(DownloadProgress.Complete(modelFile.absolutePath))
                 return@flow
             }
@@ -187,7 +190,7 @@ class ModelDownloader(private val context: Context) {
             // Check for ADB-pushed file and use it directly (no copy needed)
             val externalFile = findExternalModel(modelConfig)
             if (externalFile != null) {
-                Log.i(TAG, "Using ADB-pushed model directly from: ${externalFile.absolutePath}")
+                tag().i( "Using ADB-pushed model directly from: ${externalFile.absolutePath}")
                 emit(DownloadProgress.Complete(externalFile.absolutePath))
                 return@flow
             }
@@ -201,7 +204,7 @@ class ModelDownloader(private val context: Context) {
             // Add Authorization header if token exists
             val token = getToken()
             if (!token.isNullOrBlank()) {
-                Log.d(TAG, "Using HF Token for authentication")
+                tag().d( "Using HF Token for authentication")
                 connection.setRequestProperty("Authorization", "Bearer $token")
             }
             
@@ -236,7 +239,7 @@ class ModelDownloader(private val context: Context) {
             emit(DownloadProgress.Complete(modelFile.absolutePath))
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error downloading model: ${e.message}", e)
+            Timber.tag(TAG).e(e, "Error downloading model: ${e.message}")
             emit(DownloadProgress.Error(e.message ?: "Unknown error"))
         }
     }.flowOn(Dispatchers.IO)

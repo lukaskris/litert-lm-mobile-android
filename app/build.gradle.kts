@@ -39,6 +39,12 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -55,16 +61,19 @@ dependencies {
     
     // LiteRT + delegates
     implementation(libs.litert.core)
-    implementation(libs.litert.gpu)
+//    implementation(libs.litert.gpu)
     implementation(libs.litert.qnn)
     implementation(libs.tensorflow.lite.select.tf.ops) {
         exclude(group = "org.tensorflow", module = "tensorflow-lite")
         exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
     }
-    
+
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+
+    // Logging
+    implementation(libs.timber)
     
     // Testing
     testImplementation(libs.junit)
