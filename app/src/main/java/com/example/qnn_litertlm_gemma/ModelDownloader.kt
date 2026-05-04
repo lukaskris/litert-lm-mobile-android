@@ -2,43 +2,41 @@ package com.example.qnn_litertlm_gemma
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.os.Environment
-import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import timber.log.Timber
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-data class AdbPaths(
-    val recommendedDir: String,
-    val appSpecificDir: String
-)
-
 /**
- * Utility class for downloading LiteRT-LM models.
+ * Utility class for loading LiteRT-LM models.
  *
- * Supports two workflows:
- *   1. In-app download from HuggingFace (with optional HF token).
- *   2. Local push via ADB:
- *        adb push gemma-4-E2B-it.litertlm /sdcard/Download/
- *      The app detects the file in the Download folder and copies it to internal storage.
+ * Model source: /storage/emulated/0/Download/<filename>
+ * Push via: adb push gemma-4-E2B-it.litertlm /sdcard/Download/
+ *
+ * The model is COPIED to internal storage before loading because:
+ *   /storage/emulated/0/ uses FUSE filesystem which does NOT support
+ *   mmap alignment required by LiteRT's GPU accelerator.
+ *   Reading directly from FUSE causes SIGBUS (BUS_ADRALN) crash.
+ *
+ * Requires MANAGE_EXTERNAL_STORAGE permission.
  */
 class ModelDownloader(private val context: Context) {
-    
+
     private val prefs: SharedPreferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
 
     companion object {
         private const val TAG = "ModelDownloader"
+        private const val COPY_BUFFER_SIZE = 1024 * 1024 // 1MB buffer for fast copy
 
         private fun tag() = Timber.tag(TAG)
         private const val KEY_HF_TOKEN = "hf_token"
 
-        // Gemma 4 E2B is the default (first in list)
         val AVAILABLE_MODELS = listOf(
             ModelConfig(
                 id = "gemma4-e2b",
@@ -72,44 +70,6 @@ class ModelDownloader(private val context: Context) {
         )
     }
 
-    /**
-     * Well-known directories to check for ADB-pushed model files.
-     * On Android 11+, /sdcard/Download is restricted unless
-     * MANAGE_EXTERNAL_STORAGE permission is granted.
-     * The safest place is the app-specific external directory.
-     */
-    private fun getAdbSearchDirs(): List<File> {
-        val dirs = mutableListOf<File>()
-
-        // App-specific external storage (No permissions required)
-        context.getExternalFilesDir(null)?.let { dirs.add(it) }
-        context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.let { dirs.add(it) }
-
-        // Public directories (require MANAGE_EXTERNAL_STORAGE on Android 11+)
-        if (Environment.isExternalStorageManager()) {
-            dirs.add(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
-            dirs.add(File(Environment.getExternalStorageDirectory(), "Models"))
-        } else {
-            // Still check — works on pre-Android 11 or if permissions allow
-            dirs.add(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS))
-            dirs.add(File(Environment.getExternalStorageDirectory(), "Models"))
-        }
-
-        return dirs
-    }
-
-    /**
-     * Get recommended ADB push paths for showing in the UI dialog.
-     */
-    fun getAdbPaths(): AdbPaths {
-        val appDir = context.getExternalFilesDir(null)?.absolutePath
-            ?: "/sdcard/Android/data/${context.packageName}/files"
-        return AdbPaths(
-            recommendedDir = appDir,
-            appSpecificDir = appDir
-        )
-    }
-
     fun saveToken(token: String) {
         prefs.edit().putString(KEY_HF_TOKEN, token).apply()
     }
@@ -118,115 +78,177 @@ class ModelDownloader(private val context: Context) {
         return prefs.getString(KEY_HF_TOKEN, null)
     }
 
+    /** External source — model MUST be pushed here first */
+    private val downloadDir = File("/storage/emulated/0/Download")
+
     /**
-     * Check if a model is already available — either in internal storage
-     * or ADB-pushed to a well-known external directory.
+     * Check if a model is ready to use — either already copied to internal,
+     * or available in /storage/emulated/0/Download/ for copying.
      */
     fun isModelDownloaded(modelConfig: ModelConfig): Boolean {
-        // Check internal storage first
-        if (File(context.filesDir, modelConfig.filename).exists()) return true
-        // Check ADB push locations
-        return findExternalModel(modelConfig) != null
-    }
-
-    /**
-     * Search well-known external directories for an ADB-pushed model file.
-     */
-    private fun findExternalModel(modelConfig: ModelConfig): File? {
-        for (dir in getAdbSearchDirs()) {
-            val candidate = File(dir, modelConfig.filename)
-            if (candidate.exists() && candidate.canRead() && candidate.length() > 0) {
-                tag().i( "Found ADB-pushed model at: ${candidate.absolutePath}")
-                return candidate
-            }
-        }
-        return null
-    }
-
-    /**
-     * Get the local model path. Always ensures the file is in internal storage.
-     * If found externally (ADB push to /sdcard/Download etc.), copies to internal first
-     * because the native LiteRT-LM engine may not be able to mmap() files on external
-     * storage due to SELinux restrictions on Android 11+.
-     */
-    fun getModelPath(modelConfig: ModelConfig): String {
         val internal = File(context.filesDir, modelConfig.filename)
-        if (internal.exists() && internal.length() > 0) return internal.absolutePath
+        if (internal.exists() && internal.length() > 500_000_000L) return true
 
-        val external = findExternalModel(modelConfig)
-        if (external != null) {
-            Log.i(TAG, "Copying external model to internal storage: ${external.absolutePath} → ${internal.absolutePath}")
-            external.inputStream().use { input ->
-                internal.outputStream().use { output ->
-                    input.copyTo(output)
+        val external = File(downloadDir, modelConfig.filename)
+        val exists = external.exists() && external.canRead() && external.length() > 500_000_000L
+        tag().i("isModelDownloaded(${modelConfig.filename}): internal=${internal.exists()}, external=$exists (${external.length() / 1024 / 1024}MB)")
+        return exists
+    }
+
+    /**
+     * Get the model path on internal storage (ext4 — safe for mmap).
+     * This is a suspend function because copying 2.4GB takes time and
+     * must run on Dispatchers.IO to avoid blocking the UI thread.
+     *
+     * Flow:
+     *   1. Check internal storage — if valid (>500MB), use directly (instant)
+     *   2. Check disk space before copying
+     *   3. Copy from /storage/emulated/0/Download/ → internal storage with progress
+     *   4. Verify copied file size
+     *   5. Return internal path
+     */
+    suspend fun getModelPath(modelConfig: ModelConfig): String = withContext(Dispatchers.IO) {
+        val internal = File(context.filesDir, modelConfig.filename)
+
+        // 1. Already in internal storage and valid — instant return
+        if (internal.exists() && internal.length() > 500_000_000L) {
+            tag().i("getModelPath: using internal (${internal.length() / 1024 / 1024}MB): ${internal.absolutePath}")
+            return@withContext internal.absolutePath
+        }
+
+        // Delete incomplete internal file
+        if (internal.exists()) {
+            tag().w("getModelPath: internal file too small (${internal.length() / 1024 / 1024}MB), deleting")
+            internal.delete()
+        }
+
+        // 2. Check external source
+        val external = File(downloadDir, modelConfig.filename)
+        if (!external.exists() || !external.canRead()) {
+            tag().e("getModelPath: external file not found at ${external.absolutePath}")
+            return@withContext internal.absolutePath
+        }
+
+        // 3. Check disk space before copying
+        val sourceSize = external.length()
+        val freeSpace = context.filesDir.usableSpace
+        tag().i("getModelPath: source=${sourceSize / 1024 / 1024}MB, free=${freeSpace / 1024 / 1024}MB")
+
+        if (freeSpace < sourceSize * 2) {
+            tag().e("getModelPath: not enough disk space! need ${sourceSize / 1024 / 1024}MB, have ${freeSpace / 1024 / 1024}MB free")
+            return@withContext internal.absolutePath
+        }
+
+        // 4. Copy with progress logging
+        tag().i("getModelPath: copying ${external.absolutePath} → ${internal.absolutePath}")
+        val copied = copyToInternalStorage(external, internal)
+        if (copied) {
+            tag().i("getModelPath: copy OK, using ${internal.absolutePath}")
+        } else {
+            tag().e("getModelPath: copy FAILED")
+        }
+
+        return@withContext internal.absolutePath
+    }
+
+    /**
+     * Copy model to internal storage (ext4) so LiteRT can mmap it safely.
+     * Uses 1MB buffer for fast copy and logs progress every 500MB.
+     */
+    private fun copyToInternalStorage(source: File, dest: File): Boolean {
+        return try {
+            val startTime = System.currentTimeMillis()
+            var totalCopied = 0L
+            var lastLogTime = startTime
+
+            source.inputStream().use { input ->
+                dest.outputStream().use { output ->
+                    val buffer = ByteArray(COPY_BUFFER_SIZE)
+                    var bytesRead: Int
+
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalCopied += bytesRead
+
+                        // Log progress every 2 seconds
+                        val now = System.currentTimeMillis()
+                        if (now - lastLogTime > 2000) {
+                            val pct = totalCopied * 100 / source.length()
+                            val speedMb = (totalCopied / 1024 / 1024) / ((now - startTime) / 1000.0)
+                            tag().i("Copy progress: ${totalCopied / 1024 / 1024}/${source.length() / 1024 / 1024}MB ($pct%) — ${String.format("%.1f", speedMb)}MB/s")
+                            lastLogTime = now
+                        }
+                    }
                 }
             }
-            Log.i(TAG, "Copy complete: ${internal.length()} bytes")
-            return internal.absolutePath
-        }
 
-        // Default to internal path (for download target)
-        return internal.absolutePath
+            val duration = System.currentTimeMillis() - startTime
+
+            // Verify
+            val sizeOk = dest.exists() && dest.length() > 500_000_000L
+            if (!sizeOk) {
+                tag().e("Copy verification failed: size=${dest.length()}")
+                dest.delete()
+                return false
+            }
+
+            tag().i("Copy complete: ${dest.length() / 1024 / 1024}MB in ${duration / 1000}s (${String.format("%.1f", dest.length() / 1024.0 / 1024.0 / (duration / 1000.0))}MB/s)")
+            true
+        } catch (e: Exception) {
+            tag().e(e, "Failed to copy model to internal storage")
+            dest.delete()
+            false
+        }
     }
-    
+
     /**
      * Download model with progress reporting.
-     * If the model is found in an ADB-push location, it copies from there
-     * instead of downloading from HuggingFace.
+     * Downloads to /storage/emulated/0/Download/ then copies to internal.
      */
     fun downloadModel(modelConfig: ModelConfig): Flow<DownloadProgress> = flow {
         try {
             emit(DownloadProgress.Started)
-            
-            val modelFile = File(context.filesDir, modelConfig.filename)
-            
-            // Already in internal storage
-            if (modelFile.exists()) {
-                tag().d( "Model already exists at ${modelFile.absolutePath}")
-                emit(DownloadProgress.Complete(modelFile.absolutePath))
-                return@flow
-            }
 
-            // Check for ADB-pushed file and use it directly (no copy needed)
-            val externalFile = findExternalModel(modelConfig)
-            if (externalFile != null) {
-                tag().i( "Using ADB-pushed model directly from: ${externalFile.absolutePath}")
+            val externalFile = File(downloadDir, modelConfig.filename)
+
+            // Already exists in Download folder
+            if (externalFile.exists() && externalFile.length() > 500_000_000L) {
+                tag().i("Model already at ${externalFile.absolutePath} (${externalFile.length() / 1024 / 1024}MB)")
                 emit(DownloadProgress.Complete(externalFile.absolutePath))
                 return@flow
             }
-            
+
             // Download from HuggingFace
-            Log.d(TAG, "Downloading model from ${modelConfig.url}")
-            
+            tag().i("Downloading from ${modelConfig.url} → ${externalFile.absolutePath}")
+
             val url = URL(modelConfig.url)
             val connection = url.openConnection() as HttpURLConnection
-            
-            // Add Authorization header if token exists
+
             val token = getToken()
             if (!token.isNullOrBlank()) {
-                tag().d( "Using HF Token for authentication")
+                tag().d("Using HF Token for authentication")
                 connection.setRequestProperty("Authorization", "Bearer $token")
             }
-            
+
             connection.connect()
-            
+
             val responseCode = connection.responseCode
             if (responseCode != HttpURLConnection.HTTP_OK) {
                 throw Exception("Server returned HTTP $responseCode: ${connection.responseMessage}")
             }
-            
+
             val fileLength = connection.contentLength
-            
+
             connection.inputStream.use { input ->
-                FileOutputStream(modelFile).use { output ->
+                FileOutputStream(externalFile).use { output ->
                     val buffer = ByteArray(8192)
                     var total: Long = 0
                     var count: Int
-                    
+
                     while (input.read(buffer).also { count = it } != -1) {
                         total += count
                         output.write(buffer, 0, count)
-                        
+
                         if (fileLength > 0) {
                             val progress = (total * 100 / fileLength).toInt()
                             emit(DownloadProgress.Progress(progress, total, fileLength.toLong()))
@@ -234,10 +256,10 @@ class ModelDownloader(private val context: Context) {
                     }
                 }
             }
-            
-            Log.d(TAG, "Model downloaded successfully to ${modelFile.absolutePath}")
-            emit(DownloadProgress.Complete(modelFile.absolutePath))
-            
+
+            tag().i("Download complete: ${externalFile.absolutePath} (${externalFile.length() / 1024 / 1024}MB)")
+            emit(DownloadProgress.Complete(externalFile.absolutePath))
+
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Error downloading model: ${e.message}")
             emit(DownloadProgress.Error(e.message ?: "Unknown error"))
@@ -245,9 +267,6 @@ class ModelDownloader(private val context: Context) {
     }.flowOn(Dispatchers.IO)
 }
 
-/**
- * Sealed class representing download progress states
- */
 sealed class DownloadProgress {
     object Started : DownloadProgress()
     data class Progress(val percentage: Int, val downloaded: Long, val total: Long) : DownloadProgress()

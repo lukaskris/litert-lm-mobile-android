@@ -8,6 +8,7 @@ import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.LogSeverity
 import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
@@ -20,14 +21,17 @@ import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Data class for model performance metrics
+ * Data class for model performance metrics, populated from LiteRT-LM's
+ * experimental getBenchmarkInfo() API when available.
  */
 data class PerformanceMetrics(
     val initializationTimeMs: Long = 0,
     val timeToFirstTokenMs: Long = 0,
-    val tokensPerSecond: Double = 0.0,
+    val prefillTokensPerSecond: Double = 0.0,
+    val decodeTokensPerSecond: Double = 0.0,
     val activeBackend: String = "Unknown",
     val memoryUsageMb: Long = 0
 )
@@ -37,14 +41,20 @@ data class PerformanceMetrics(
  * Handles model initialization, conversation management,
  * and multimodal message sending (text, image, audio).
  *
- * Backend fallback chain: NPU → GPU → CPU
+ * Backend fallback chain: NPU → CPU → GPU
+ *
+ * GPU is last because libLiteRtGpuAccelerator.so can SIGBUS on some devices,
+ * which kills the process before fallback can be attempted.
  */
 class LiteRTLMManager private constructor(private val context: Context) {
 
-    private var engine: Engine? = null
-    private var conversation: com.google.ai.edge.litertlm.Conversation? = null
-    private var isInitialized = false
-    private var currentBackendName: String = "CPU"
+    @Volatile private var engine: Engine? = null
+    @Volatile private var conversation: com.google.ai.edge.litertlm.Conversation? = null
+    @Volatile private var isInitialized = false
+    @Volatile private var currentBackendName: String = "CPU"
+
+    /** Check if the engine has been initialized. */
+    fun isInitialized(): Boolean = isInitialized
 
     /**
      * Dedicated dispatcher for inference — deliberately isolated from
@@ -78,19 +88,58 @@ class LiteRTLMManager private constructor(private val context: Context) {
         private const val NPU_INIT_TIMEOUT_MS = 30_000L
 
         init {
+            // Reduce native logging overhead — only show ERROR+ in production.
+            // Default is INFO which adds CPU overhead on low-end devices.
             try {
-                // Order matters: dependencies first
-                System.loadLibrary("QnnSystem")
-                System.loadLibrary("QnnHtp")
-                System.loadLibrary("QnnHtpV79Stub")
-                System.loadLibrary("GemmaModelConstraintProvider")
+                Engine.setNativeMinLogSeverity(LogSeverity.ERROR)
+            } catch (e: Exception) {
+                Timber.tag(TAG).w("Failed to set native log severity: ${e.message}")
+            }
+            try {
+                // Common libs — always needed
                 System.loadLibrary("LiteRt")
-                System.loadLibrary("LiteRtDispatch_Qualcomm")
                 System.loadLibrary("LiteRtGpuAccelerator")
                 System.loadLibrary("LiteRtOpenClAccelerator")
-                Timber.tag(TAG).i("Native libraries loaded successfully")
+                Timber.tag(TAG).i("Common native libraries loaded successfully")
             } catch (e: UnsatisfiedLinkError) {
-                Timber.tag(TAG).w("Some native libraries not available: ${e.message}")
+                Timber.tag(TAG).w("Some common native libraries not available: ${e.message}")
+            }
+        }
+
+        /**
+         * Load QNN (Qualcomm NPU) native libraries lazily.
+         * Only call when NPU backend is actually selected — these libs
+         * don't exist on non-Qualcomm devices and waste startup time.
+         */
+        @Volatile
+        private var qnnLibsLoaded = false
+
+        fun loadQnnLibraries(): Boolean {
+            if (qnnLibsLoaded) {
+                Timber.tag(TAG).d("[LoadModel] QNN libs already loaded — skipping")
+                return true
+            }
+            return synchronized(this) {
+                if (qnnLibsLoaded) return true
+                try {
+                    Timber.tag(TAG).d("[LoadModel] Loading QNN native libs...")
+                    System.loadLibrary("QnnSystem")
+                    Timber.tag(TAG).d("[LoadModel]   + QnnSystem OK")
+                    System.loadLibrary("QnnHtp")
+                    Timber.tag(TAG).d("[LoadModel]   + QnnHtp OK")
+                    System.loadLibrary("QnnHtpV79Stub")
+                    Timber.tag(TAG).d("[LoadModel]   + QnnHtpV79Stub OK")
+                    System.loadLibrary("GemmaModelConstraintProvider")
+                    Timber.tag(TAG).d("[LoadModel]   + GemmaModelConstraintProvider OK")
+                    System.loadLibrary("LiteRtDispatch_Qualcomm")
+                    Timber.tag(TAG).d("[LoadModel]   + LiteRtDispatch_Qualcomm OK")
+                    qnnLibsLoaded = true
+                    Timber.tag(TAG).d("[LoadModel] All QNN native libraries loaded successfully")
+                    true
+                } catch (e: UnsatisfiedLinkError) {
+                    Timber.tag(TAG).e("[LoadModel] QNN lib FAILED: ${e.message}")
+                    false
+                }
             }
         }
 
@@ -106,7 +155,8 @@ class LiteRTLMManager private constructor(private val context: Context) {
     
     /**
      * Initialize the LiteRT-LM Engine with the specified model.
-     * Uses NPU → GPU → CPU fallback chain.
+     * Uses NPU → CPU → GPU fallback chain.
+     * GPU is last to avoid native SIGBUS crash that kills the process.
      */
     suspend fun initialize(
         modelPath: String,
@@ -114,25 +164,28 @@ class LiteRTLMManager private constructor(private val context: Context) {
         isEmbedding: Boolean = false,
         preferredBackend: String? = null
     ): Result<Boolean> = withContext(Dispatchers.IO) {
-        Timber.tag(TAG).i( "Initializing for: $modelPath (preferred: $preferredBackend)")
+        Timber.tag(TAG).d("[LoadModel] === START initialize === path=$modelPath, preferred=$preferredBackend, isEmbedding=$isEmbedding")
         if (isInitialized) {
+            Timber.tag(TAG).d("[LoadModel] Already initialized — cleaning up previous engine first")
             cleanup()
         }
-        
+
         try {
             if (isEmbedding) {
                 Timber.tag(TAG).w( "Embedding mode not supported in this version")
                 currentBackendName = "CPU"
             } else {
                 // Build ordered backend list based on preference
+                Timber.tag(TAG).d("[LoadModel] Step 1: Building backend list...")
                 val backends = buildBackendList(preferredBackend)
+                Timber.tag(TAG).d("[LoadModel] Step 2: Backend list = ${backends.map { it.name }}, starting fallback loop...")
                 initializeEngineWithFallback(modelPath, backends)
             }
             isInitialized = true
-            Timber.tag(TAG).i( "Initialization SUCCEEDED on backend: $currentBackendName")
+            Timber.tag(TAG).d("[LoadModel] === END initialize OK === backend=$currentBackendName")
             Result.success(true)
         } catch (e: Throwable) {
-            Timber.tag(TAG).e(e, "Initialization FAILED: ${e.message}")
+            Timber.tag(TAG).e(e, "[LoadModel] === END initialize FAILED === ${e.javaClass.simpleName}: ${e.message}")
             Result.failure(Exception(e))
         }
     }
@@ -181,19 +234,25 @@ class LiteRTLMManager private constructor(private val context: Context) {
         val nativeLibDir = context.applicationInfo.nativeLibraryDir
         Timber.tag(TAG).i( "SoC vendor detected: $socVendor (model=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else "N/A"}, hardware=${Build.HARDWARE}, nativeLibDir=$nativeLibDir)")
 
-        val npuBackend = BackendFactory("NPU", nativeLibraryDir = nativeLibDir) {
-            Backend.NPU(nativeLibraryDir = nativeLibDir)
-        }
         val gpuBackend = BackendFactory("GPU") { Backend.GPU() }
         val cpuBackend = BackendFactory("CPU") { Backend.CPU() }
 
-        val backends = when (socVendor) {
-            "QUALCOMM" -> {
-                Timber.tag(TAG).i( "Qualcomm SoC: NPU → GPU → CPU")
-                listOf(npuBackend, gpuBackend, cpuBackend)
+        val backends = when {
+            socVendor == "QUALCOMM" && loadQnnLibraries() -> {
+                Timber.tag(TAG).i( "Qualcomm SoC with QNN libs: NPU → CPU → GPU")
+                val npuBackend = BackendFactory("NPU", nativeLibraryDir = nativeLibDir) {
+                    Backend.NPU(nativeLibraryDir = nativeLibDir)
+                }
+                // CPU before GPU — GPU SIGBUS kills the process (cannot catch native signal).
+                // Only try GPU if CPU also fails.
+                listOf(npuBackend, cpuBackend, gpuBackend)
+            }
+            socVendor == "QUALCOMM" -> {
+                Timber.tag(TAG).w( "Qualcomm SoC but QNN libs failed to load: CPU → GPU")
+                listOf(cpuBackend, gpuBackend)
             }
             else -> {
-                Timber.tag(TAG).i( "Non-Qualcomm SoC ($socVendor): GPU → CPU (skipping NPU)")
+                Timber.tag(TAG).i( "Non-Qualcomm SoC ($socVendor): CPU → GPU (skipping NPU)")
                 listOf(gpuBackend, cpuBackend)
             }
         }
@@ -218,15 +277,18 @@ class LiteRTLMManager private constructor(private val context: Context) {
     private fun initializeEngineWithFallback(modelPath: String, backends: List<BackendFactory>) {
         var lastError: Throwable? = null
 
-        for (factory in backends) {
+        Timber.tag(TAG).d("[LoadModel] Fallback loop: will try ${backends.map { it.name }}")
+
+        for ((index, factory) in backends.withIndex()) {
             val attemptStart = System.currentTimeMillis()
             try {
-                Timber.tag(TAG).i( "Trying backend: ${factory.name}")
+                Timber.tag(TAG).d("[LoadModel] Fallback [${index + 1}/${backends.size}]: trying backend=${factory.name}")
 
                 if (factory.name == "NPU") {
                     // Run NPU init on a separate thread with timeout.
                     // NPU can hang for 60-120s on models without AOT payloads —
                     // we don't want to block the caller indefinitely.
+                    Timber.tag(TAG).d("[LoadModel] NPU detected — using timeout wrapper (${NPU_INIT_TIMEOUT_MS}ms)")
                     val result = runWithTimeout(NPU_INIT_TIMEOUT_MS) {
                         initializeEngine(modelPath, factory)
                     }
@@ -239,18 +301,19 @@ class LiteRTLMManager private constructor(private val context: Context) {
                 }
 
                 val attemptMs = System.currentTimeMillis() - attemptStart
-                Timber.tag(TAG).i( "Backend ${factory.name} SUCCEEDED in ${attemptMs}ms")
+                Timber.tag(TAG).d("[LoadModel] Backend ${factory.name} SUCCEEDED in ${attemptMs}ms")
                 return
             } catch (e: Throwable) {
                 val attemptMs = System.currentTimeMillis() - attemptStart
-                Timber.tag(TAG).w( "Backend ${factory.name} FAILED after ${attemptMs}ms: ${e.message}")
+                Timber.tag(TAG).d("[LoadModel] Backend ${factory.name} FAILED after ${attemptMs}ms: ${e.javaClass.simpleName}: ${e.message}")
                 if (factory.name == "NPU") {
-                    Timber.tag(TAG).i( "NPU failed — falling back to next backend")
+                    Timber.tag(TAG).d("[LoadModel] NPU failed — falling back to next backend")
                 }
                 lastError = e
             }
         }
 
+        Timber.tag(TAG).e("[LoadModel] ALL backends failed — throwing last error")
         throw lastError ?: IllegalStateException("All backends failed")
     }
 
@@ -259,12 +322,12 @@ class LiteRTLMManager private constructor(private val context: Context) {
      * Returns Result.success if completed, Result.failure if timed out or threw.
      */
     private fun runWithTimeout(timeoutMs: Long, block: () -> Unit): Result<Unit> {
-        var exception: Throwable? = null
+        val exceptionRef = AtomicReference<Throwable?>(null)
         val thread = Thread {
             try {
                 block()
             } catch (e: Throwable) {
-                exception = e
+                exceptionRef.set(e)
             }
         }
         thread.name = "npu-init-timeout"
@@ -278,24 +341,52 @@ class LiteRTLMManager private constructor(private val context: Context) {
                 thread.interrupt()
                 Result.failure(Exception("NPU initialization timed out after ${timeoutMs}ms"))
             }
-            exception != null -> Result.failure(exception!!)
+            exceptionRef.get() != null -> Result.failure(exceptionRef.get()!!)
             else -> Result.success(Unit)
         }
     }
 
     private fun initializeEngine(modelPath: String, factory: BackendFactory) {
+        Timber.tag(TAG).d("[LoadModel] --- initializeEngine START --- backend=${factory.name}, path=$modelPath")
+
         val file = File(modelPath)
         if (!file.exists()) {
+            Timber.tag(TAG).e("[LoadModel] Step: File existence check FAILED — $modelPath does not exist")
             throw java.io.FileNotFoundException("Model file not found at $modelPath")
         }
         if (!file.canRead()) {
-            throw java.io.IOException("Model file not readable (permissions?)")
+            Timber.tag(TAG).e("[LoadModel] Step: File readability check FAILED — $modelPath not readable")
+            throw java.io.IOException("Model file not readable (permissions?) at $modelPath")
         }
-        Timber.tag(TAG).i( "Model file: ${file.length()} bytes, backend: ${factory.name}")
 
+        val fileSize = file.length()
+        Timber.tag(TAG).d("[LoadModel] Step: File checks OK — size=${fileSize} bytes (${fileSize / 1024 / 1024}MB), backend=${factory.name}")
+
+        // Validate model file — LiteRT-LM models should be at least 100MB.
+        // Corrupt/incomplete downloads or scoped storage issues can produce
+        // tiny files that fail with "TF_LITE_PREFILL_DECODE not found".
+        if (fileSize < 100_000_000L) {
+            Timber.tag(TAG).e("[LoadModel] Step: File size validation FAILED — too small (${fileSize} bytes)")
+            throw java.io.IOException(
+                "Model file too small ($fileSize bytes / ${fileSize / 1024 / 1024}MB). " +
+                "File is likely corrupt or incomplete. Delete and re-download. Path: $modelPath"
+            )
+        }
+
+        // Quick header check — read first 4 bytes to verify it's a valid model file.
+        try {
+            file.inputStream().buffered().use { stream ->
+                val header = ByteArray(4)
+                val read = stream.read(header)
+                Timber.tag(TAG).d("[LoadModel] Step: Header bytes = ${header.take(read).map { String.format("%02X", it) }}")
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).w("[LoadModel] Step: Could not read model header: ${e.message}")
+        }
+
+        Timber.tag(TAG).d("[LoadModel] Step: Creating backend instance for ${factory.name}...")
         val backend = factory.create()
-
-        Timber.tag(TAG).i( "Initializing Engine with backend: ${factory.name}")
+        Timber.tag(TAG).d("[LoadModel] Step: Backend instance created OK: $backend")
 
         // Set ADSP_LIBRARY_PATH for NPU — QNN needs to find SKEL stubs.
         // Only set when actually trying NPU backend.
@@ -303,19 +394,28 @@ class LiteRTLMManager private constructor(private val context: Context) {
             try {
                 val libDir = factory.nativeLibraryDir ?: context.applicationInfo.nativeLibraryDir
                 android.system.Os.setenv("ADSP_LIBRARY_PATH", libDir, true)
-                Timber.tag(TAG).i( "Set ADSP_LIBRARY_PATH to $libDir for NPU")
+                Timber.tag(TAG).d("[LoadModel] Step: Set ADSP_LIBRARY_PATH=$libDir for NPU")
             } catch (e: Exception) {
-                Timber.tag(TAG).w( "Failed to set ADSP_LIBRARY_PATH: ${e.message}")
+                Timber.tag(TAG).w("[LoadModel] Step: Failed to set ADSP_LIBRARY_PATH: ${e.message}")
             }
         }
 
-        // Vision always uses GPU — CPU vision encoding is fundamentally too slow
-        // for production use (5+ minutes on non-Qualcomm devices).
-        // On MediaTek Mali, this causes a ~12s GPU lockup during vision encoding,
-        // but the alternative (CPU) never completes in reasonable time.
-        val visionBackend = Backend.GPU()
-        Timber.tag(TAG).i( "Vision backend: GPU")
+        // Vision backend: use GPU only when main backend is NPU or GPU.
+        // When main backend is CPU, also use CPU for vision — GPU accelerator
+        // crashes with SIGSEGV/SIGBUS on some devices (e.g. Samsung SM7635),
+        // and the crash happens during nativeCreateEngine even if main backend is CPU.
+        val visionBackend = when (factory.name) {
+            "CPU" -> {
+                Timber.tag(TAG).d("[LoadModel] Step: Vision backend = CPU (GPU skipped — main backend is CPU)")
+                Backend.CPU()
+            }
+            else -> {
+                Timber.tag(TAG).d("[LoadModel] Step: Vision backend = GPU, Audio backend = CPU")
+                Backend.GPU()
+            }
+        }
 
+        Timber.tag(TAG).d("[LoadModel] Step: Building EngineConfig... modelPath=$modelPath, cacheDir=${context.cacheDir.path}")
         val engineConfig = EngineConfig(
             modelPath = modelPath,
             backend = backend,
@@ -325,74 +425,88 @@ class LiteRTLMManager private constructor(private val context: Context) {
         )
 
         val startTime = System.currentTimeMillis()
-        val candidateEngine = Engine(engineConfig)
+        Timber.tag(TAG).d("[LoadModel] Step: Calling Engine(engineConfig) constructor...")
+        val candidateEngine = try {
+            Engine(engineConfig)
+        } catch (e: Throwable) {
+            // Engine constructor can crash with native SIGSEGV on corrupt models,
+            // but sometimes it throws a Java exception first — catch those.
+            Timber.tag(TAG).e("[LoadModel] Step: Engine constructor threw ${e.javaClass.simpleName}: ${e.message}")
+            throw e
+        }
+        Timber.tag(TAG).d("[LoadModel] Step: Engine constructor OK (${System.currentTimeMillis() - startTime}ms), calling initialize()...")
 
         try {
             candidateEngine.initialize()
             val duration = System.currentTimeMillis() - startTime
-            Timber.tag(TAG).i( "Engine initialization SUCCEEDED in ${duration}ms")
+            Timber.tag(TAG).d("[LoadModel] Step: Engine.initialize() SUCCEEDED in ${duration}ms")
 
             // Verify conversation works — wrap separately so test failure
             // doesn't cascade into closing the engine
             try {
+                Timber.tag(TAG).d("[LoadModel] Step: Creating test conversation...")
                 val testConv = candidateEngine.createConversation(ConversationConfig())
                 testConv.close()
-                Timber.tag(TAG).i( "Test conversation OK")
+                Timber.tag(TAG).d("[LoadModel] Step: Test conversation OK")
             } catch (e: Throwable) {
-                Timber.tag(TAG).w( "Test conversation failed (non-fatal): ${e.message}")
+                Timber.tag(TAG).w("[LoadModel] Step: Test conversation failed (non-fatal): ${e.message}")
             }
         } catch (e: Throwable) {
             val duration = System.currentTimeMillis() - startTime
-            Timber.tag(TAG).e( "Engine initialization FAILED after ${duration}ms: ${e.message}")
+            Timber.tag(TAG).e("[LoadModel] Step: Engine.initialize() FAILED after ${duration}ms — ${e.javaClass.simpleName}: ${e.message}")
             if (factory.name == "NPU" && e.message?.contains("TF_LITE_AUX") == true) {
-                Timber.tag(TAG).e( "NPU missing AOT payload and JIT compilation failed or was not triggered.")
+                Timber.tag(TAG).e("[LoadModel] NPU missing AOT payload and JIT compilation failed or was not triggered.")
             }
             try {
                 candidateEngine.close()
             } catch (closeErr: Throwable) {
-                Timber.tag(TAG).w( "Error closing failed engine: ${closeErr.message}")
+                Timber.tag(TAG).w("[LoadModel] Step: Error closing failed engine: ${closeErr.message}")
             }
-            throw e
+            throw e  // Re-throw so fallback chain works
         }
 
         engine = candidateEngine
         currentBackendName = factory.name
+        Timber.tag(TAG).d("[LoadModel] --- initializeEngine END OK --- backend=$currentBackendName")
     }
 
     /**
      * Start a new conversation.
      */
     fun startConversation(systemPrompt: String? = null) {
+        Timber.tag(TAG).d("[LoadModel] startConversation called — initialized=$isInitialized, engine=${engine != null}")
         if (!isInitialized || engine == null) {
             throw IllegalStateException("Engine not initialized.")
         }
-        
+
+        // Close existing conversation — the engine only supports one session at a time.
+        try {
+            conversation?.close()
+        } catch (e: Exception) {
+            Timber.tag(TAG).w("Error closing previous conversation: ${e.message}")
+        }
+        conversation = null
+
         val conversationConfig = ConversationConfig(
             systemInstruction = if (systemPrompt != null) Contents.of(systemPrompt) else null,
             samplerConfig = SamplerConfig(
-                temperature = 0.7,
-                topK = 40,
+                temperature = 0.4,
+                topK = 64,
                 topP = 0.9
             )
         )
         conversation = engine?.createConversation(conversationConfig)
+        Timber.tag(TAG).d("[LoadModel] Conversation created OK — systemPrompt=${systemPrompt != null}")
     }
 
     /**
      * Send a text-only message and stream the response.
-     * Inference runs on Dispatchers.IO so it never blocks the UI or Default thread pool.
-     * buffer() decouples the native producer from the Kotlin consumer.
+     * Inference runs on [inferenceDispatcher] so it never blocks the UI thread.
      */
-    fun sendMessage(text: String): Flow<String> {
+    suspend fun sendMessage(text: String): Flow<String> {
         ensureConversation()
         return conversation!!.sendMessageAsync(text)
-            .map { msg ->
-                // Periodically yield CPU so UI thread can run.
-                // Without this, a tight native loop at below-normal priority
-                // can still cause scheduler latency on low-end devices.
-                Thread.yield()
-                msg.toString()
-            }
+            .map { msg -> msg.toString() }
             .buffer(capacity = 64)
             .flowOn(inferenceDispatcher)
     }
@@ -400,9 +514,8 @@ class LiteRTLMManager private constructor(private val context: Context) {
     /**
      * Send a multimodal message with optional image and/or audio.
      *
-     * buildMultimodalContents() is CPU-heavy (decodes bitmap, prepares GPU input).
-     * It is called inside flowOn(Dispatchers.IO) so it NEVER blocks the caller
-     * (typically the Main thread).
+     * IMPORTANT: The caller MUST call [startConversation] BEFORE invoking this.
+     * This method does NOT reset the conversation — it uses whatever session exists.
      */
     fun sendMultimodalMessage(
         text: String,
@@ -413,17 +526,16 @@ class LiteRTLMManager private constructor(private val context: Context) {
         Timber.tag(TAG).i( "Multimodal message: text='${text.take(50)}', image=$imagePath, audio=${audioBytes != null}")
         val conv = conversation!!
         return kotlinx.coroutines.flow.flow {
-            // This block runs on Dispatchers.IO (via flowOn below).
+            // This block runs on inferenceDispatcher (via flowOn below).
             // Content.ImageFile() decodes the bitmap here — off the main thread.
             val contents = buildMultimodalContents(text, imagePath, audioBytes)
             conv.sendMessageAsync(contents)
                 .collect { msg ->
-                    Thread.yield()
                     emit(msg.toString())
                 }
         }
             .buffer(capacity = 64)
-            .flowOn(Dispatchers.IO)
+            .flowOn(inferenceDispatcher)
     }
 
     /**
@@ -439,7 +551,13 @@ class LiteRTLMManager private constructor(private val context: Context) {
         val contentParts = mutableListOf<Content>()
 
         if (imagePath != null) {
-            contentParts.add(Content.ImageFile(imagePath))
+            val imgFile = File(imagePath)
+            if (imgFile.exists() && imgFile.canRead()) {
+                Timber.tag(TAG).i("Adding image: ${imgFile.length() / 1024}KB, ${imgFile.absolutePath}")
+                contentParts.add(Content.ImageFile(imagePath))
+            } else {
+                Timber.tag(TAG).e("Image file not accessible: $imagePath (exists=${imgFile.exists()})")
+            }
         }
         if (audioBytes != null) {
             contentParts.add(Content.AudioBytes(audioBytes))
@@ -459,6 +577,30 @@ class LiteRTLMManager private constructor(private val context: Context) {
     }
 
     fun getActiveBackendName(): String = currentBackendName
+
+    /**
+     * Get real performance metrics from LiteRT-LM's getBenchmarkInfo() API.
+     * Returns null if conversation is not active or API is unavailable.
+     */
+    @kotlin.OptIn(com.google.ai.edge.litertlm.ExperimentalApi::class)
+    fun getPerformanceMetrics(): PerformanceMetrics? {
+        if (!isInitialized || conversation == null) return null
+        return try {
+            val benchmarkInfo = conversation?.getBenchmarkInfo()
+            PerformanceMetrics(
+                prefillTokensPerSecond = benchmarkInfo?.lastPrefillTokensPerSecond ?: 0.0,
+                decodeTokensPerSecond = benchmarkInfo?.lastDecodeTokensPerSecond ?: 0.0,
+                activeBackend = currentBackendName,
+                memoryUsageMb = getMemoryUsageMb()
+            )
+        } catch (e: Exception) {
+            Timber.tag(TAG).w("getBenchmarkInfo not available: ${e.message}")
+            PerformanceMetrics(
+                activeBackend = currentBackendName,
+                memoryUsageMb = getMemoryUsageMb()
+            )
+        }
+    }
 
     fun getMemoryUsageMb(): Long {
         val runtime = Runtime.getRuntime()

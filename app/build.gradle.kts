@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.compose.compiler)
 }
 
 android {
@@ -33,16 +34,26 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions {
-        jvmTarget = "11"
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+        }
     }
     buildFeatures {
         viewBinding = true
+        compose = true
+        buildConfig = true
     }
 
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // litertlm-android and litert-core both bundle these native libs.
+            // pickFirst uses the first occurrence found and avoids the duplicate error.
+            pickFirst("**/libLiteRtClGlAccelerator.so")
+            pickFirst("**/libLiteRtGpuAccelerator.so")
+            pickFirst("**/libLiteRtOpenClAccelerator.so")
+            pickFirst("**/libLiteRt.so")
         }
     }
 }
@@ -55,10 +66,10 @@ dependencies {
     implementation(libs.androidx.activity.ktx)
     implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.security.crypto)
-    
+
     // LiteRT-LM
     implementation(libs.litertlm.android)
-    
+
     // LiteRT + delegates
     implementation(libs.litert.core)
 //    implementation(libs.litert.gpu)
@@ -74,7 +85,18 @@ dependencies {
 
     // Logging
     implementation(libs.timber)
-    
+
+    // Jetpack Compose
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.graphics)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons)
+    implementation(libs.activity.compose)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.runtime.compose)
+    debugImplementation(libs.compose.ui.tooling)
+
     // Testing
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
