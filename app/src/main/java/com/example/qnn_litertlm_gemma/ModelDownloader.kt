@@ -202,6 +202,100 @@ class ModelDownloader(private val context: Context) {
     }
 
     /**
+     * Check if model is already in internal storage and valid.
+     * Fast check — no external storage access needed.
+     */
+    fun isModelInInternal(modelConfig: ModelConfig): Boolean {
+        val internal = File(context.filesDir, modelConfig.filename)
+        return internal.exists() && internal.length() > 500_000_000L
+    }
+
+    /**
+     * Copy model from /sdcard/Download/ to internal storage with progress reporting.
+     * This is the primary flow for release builds where adb push is not available.
+     *
+     * Flow:
+     *   1. Already in internal → instant Complete
+     *   2. Found in /sdcard/Download/ → copy with progress
+     *   3. Not found → Error with instructions
+     */
+    fun copyFromExternalWithProgress(modelConfig: ModelConfig): Flow<DownloadProgress> = flow {
+        val internal = File(context.filesDir, modelConfig.filename)
+
+        // Fast path — already in internal
+        if (internal.exists() && internal.length() > 500_000_000L) {
+            tag().i("Model already in internal: ${internal.length() / 1024 / 1024}MB")
+            emit(DownloadProgress.Complete(internal.absolutePath))
+            return@flow
+        }
+
+        // Delete incomplete internal file
+        if (internal.exists()) {
+            tag().w("Internal file incomplete (${internal.length() / 1024 / 1024}MB), deleting")
+            internal.delete()
+        }
+
+        // Check external source
+        val external = File(downloadDir, modelConfig.filename)
+        if (!external.exists() || !external.canRead() || external.length() < 500_000_000L) {
+            val msg = "Model not found. Place ${modelConfig.filename} in /sdcard/Download/ folder (${(external.length() / 1024 / 1024)}MB found, need >500MB)"
+            tag().e(msg)
+            emit(DownloadProgress.Error(msg))
+            return@flow
+        }
+
+        // Check disk space
+        val sourceSize = external.length()
+        val freeSpace = internal.parentFile?.usableSpace ?: 0L
+        if (freeSpace < sourceSize * 2) {
+            val msg = "Not enough storage. Need ${sourceSize / 1024 / 1024}MB, have ${freeSpace / 1024 / 1024}MB free"
+            tag().e(msg)
+            emit(DownloadProgress.Error(msg))
+            return@flow
+        }
+
+        // Copy with progress
+        emit(DownloadProgress.Started)
+        tag().i("Copying ${external.absolutePath} → ${internal.absolutePath} (${sourceSize / 1024 / 1024}MB)")
+
+        val startTime = System.currentTimeMillis()
+        var totalCopied = 0L
+
+        try {
+            external.inputStream().use { input ->
+                internal.outputStream().use { output ->
+                    val buffer = ByteArray(COPY_BUFFER_SIZE)
+                    var bytesRead: Int
+
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalCopied += bytesRead
+
+                        val pct = (totalCopied * 100 / sourceSize).toInt()
+                        emit(DownloadProgress.Progress(pct, totalCopied, sourceSize))
+                    }
+                }
+            }
+
+            // Verify
+            if (!internal.exists() || internal.length() < 500_000_000L) {
+                tag().e("Copy verification failed: size=${internal.length()}")
+                internal.delete()
+                emit(DownloadProgress.Error("Copy verification failed. File may be corrupt."))
+                return@flow
+            }
+
+            val duration = (System.currentTimeMillis() - startTime) / 1000
+            tag().i("Copy complete: ${internal.length() / 1024 / 1024}MB in ${duration}s")
+            emit(DownloadProgress.Complete(internal.absolutePath))
+        } catch (e: Exception) {
+            tag().e(e, "Copy failed at ${totalCopied / 1024 / 1024}MB")
+            internal.delete()
+            emit(DownloadProgress.Error("Copy failed: ${e.message}"))
+        }
+    }.flowOn(Dispatchers.IO)
+
+    /**
      * Download model with progress reporting.
      * Downloads to /storage/emulated/0/Download/ then copies to internal.
      */

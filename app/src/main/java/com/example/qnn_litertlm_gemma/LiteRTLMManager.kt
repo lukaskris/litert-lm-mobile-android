@@ -8,6 +8,8 @@ import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.LogSeverity
 import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.Dispatchers
@@ -95,15 +97,12 @@ class LiteRTLMManager private constructor(private val context: Context) {
             } catch (e: Exception) {
                 Timber.tag(TAG).w("Failed to set native log severity: ${e.message}")
             }
-            try {
-                // Common libs — always needed
-                System.loadLibrary("LiteRt")
-                System.loadLibrary("LiteRtGpuAccelerator")
-                System.loadLibrary("LiteRtOpenClAccelerator")
-                Timber.tag(TAG).i("Common native libraries loaded successfully")
-            } catch (e: UnsatisfiedLinkError) {
-                Timber.tag(TAG).w("Some common native libraries not available: ${e.message}")
-            }
+            // NOTE: Do NOT manually load LiteRt / GPU / OpenCL libs here.
+            // litertlm-android v0.11.0 ships its own libLiteRt.so and
+            // libLiteRtClGlAccelerator.so.  The SDK's NativeLibraryLoader
+            // loads litertlm_jni.so automatically; the dynamic linker then
+            // resolves libLiteRt.so from the same directory.
+            // Manually loading an old/wrong version causes ABI mismatch → SIGSEGV.
         }
 
         /**
@@ -248,8 +247,8 @@ class LiteRTLMManager private constructor(private val context: Context) {
                 listOf(npuBackend, cpuBackend, gpuBackend)
             }
             socVendor == "QUALCOMM" -> {
-                Timber.tag(TAG).w( "Qualcomm SoC but QNN libs failed to load: CPU → GPU")
-                listOf(cpuBackend, gpuBackend)
+                Timber.tag(TAG).w( "Qualcomm SoC but QNN libs failed to load: GPU → CPU")
+                listOf(gpuBackend, cpuBackend)
             }
             else -> {
                 Timber.tag(TAG).i( "Non-Qualcomm SoC ($socVendor): CPU → GPU (skipping NPU)")
@@ -346,6 +345,7 @@ class LiteRTLMManager private constructor(private val context: Context) {
         }
     }
 
+    @OptIn(ExperimentalApi::class)
     private fun initializeEngine(modelPath: String, factory: BackendFactory) {
         Timber.tag(TAG).d("[LoadModel] --- initializeEngine START --- backend=${factory.name}, path=$modelPath")
 
@@ -400,22 +400,38 @@ class LiteRTLMManager private constructor(private val context: Context) {
             }
         }
 
-        // Vision backend: use GPU only when main backend is NPU or GPU.
-        // When main backend is CPU, also use CPU for vision — GPU accelerator
-        // crashes with SIGSEGV/SIGBUS on some devices (e.g. Samsung SM7635),
-        // and the crash happens during nativeCreateEngine even if main backend is CPU.
+        // Vision backend strategy:
+        //   NPU main → GPU vision  (NPU doesn't use GPU, so GPU is free)
+        //   GPU main → CPU vision  (free GPU for UI rendering + token decode)
+        //   CPU main → CPU vision  (GPU accelerator can SIGSEGV on some devices)
+        //
+        // When main=GPU, moving vision to CPU cuts GPU load ~50% — the GPU
+        // only runs token decode (~50-100ms per step), leaving gaps for the
+        // Android HWUI renderer to push frames.
         val visionBackend = when (factory.name) {
             "CPU" -> {
                 Timber.tag(TAG).d("[LoadModel] Step: Vision backend = CPU (GPU skipped — main backend is CPU)")
                 Backend.CPU()
             }
+            "GPU" -> {
+                Timber.tag(TAG).d("[LoadModel] Step: Vision backend = CPU (freeing GPU for UI + decode)")
+                Backend.CPU()
+            }
             else -> {
-                Timber.tag(TAG).d("[LoadModel] Step: Vision backend = GPU, Audio backend = CPU")
+                Timber.tag(TAG).d("[LoadModel] Step: Vision backend = GPU (NPU main — GPU is free)")
                 Backend.GPU()
             }
         }
 
         Timber.tag(TAG).d("[LoadModel] Step: Building EngineConfig... modelPath=$modelPath, cacheDir=${context.cacheDir.path}")
+
+        // Enable speculative decoding (MTP) for Gemma 4 — delivers >2x faster decode.
+        // Only enable for CPU/NPU backends; GPU does not support speculative decoding
+        // and enabling it causes SIGSEGV in native code.
+        val enableMtp = factory.name != "GPU"
+        ExperimentalFlags.enableSpeculativeDecoding = enableMtp
+        Timber.tag(TAG).d("[LoadModel] Step: Speculative decoding (MTP) = $enableMtp (backend=${factory.name})")
+
         val engineConfig = EngineConfig(
             modelPath = modelPath,
             backend = backend,
@@ -532,6 +548,11 @@ class LiteRTLMManager private constructor(private val context: Context) {
             conv.sendMessageAsync(contents)
                 .collect { msg ->
                     emit(msg.toString())
+                    // Yield between tokens: gives the GPU a brief window
+                    // to process pending UI render work before the next
+                    // token decode starts. On low-end GPUs (Mali-G52 etc.)
+                    // this prevents the UI from starving during inference.
+                    kotlinx.coroutines.yield()
                 }
         }
             .buffer(capacity = 64)

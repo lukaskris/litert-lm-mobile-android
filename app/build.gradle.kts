@@ -48,11 +48,9 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            // litertlm-android and litert-core both bundle these native libs.
-            // pickFirst uses the first occurrence found and avoids the duplicate error.
+            // litertlm-android v0.11.0 ships libLiteRt.so and libLiteRtClGlAccelerator.so.
+            // If litert-core is re-added later, pickFirst prevents duplicate errors.
             pickFirst("**/libLiteRtClGlAccelerator.so")
-            pickFirst("**/libLiteRtGpuAccelerator.so")
-            pickFirst("**/libLiteRtOpenClAccelerator.so")
             pickFirst("**/libLiteRt.so")
         }
     }
@@ -66,18 +64,19 @@ dependencies {
     implementation(libs.androidx.activity.ktx)
     implementation(libs.androidx.recyclerview)
     implementation(libs.androidx.security.crypto)
+    implementation(libs.androidx.exifinterface)
 
     // LiteRT-LM
     implementation(libs.litertlm.android)
 
     // LiteRT + delegates
-    implementation(libs.litert.core)
+//    implementation(libs.litert.core)
 //    implementation(libs.litert.gpu)
-    implementation(libs.litert.qnn)
-    implementation(libs.tensorflow.lite.select.tf.ops) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite")
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-    }
+//    implementation(libs.litert.qnn)
+//    implementation(libs.tensorflow.lite.select.tf.ops) {
+//        exclude(group = "org.tensorflow", module = "tensorflow-lite")
+//        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
+//    }
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
